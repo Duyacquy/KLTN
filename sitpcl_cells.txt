@@ -1,0 +1,575 @@
+=== Cell 0 [markdown] ===
+# STANCEOSAURUS BENCHMARK: SITPCL WITH BERTWEET BACKBONE (FAIR COMPARISON)
+Notebook này hiện thực giải pháp **SITPCL** (Speaker Interaction and Target-aware Prototypical Contrastive Learning - *ACL 2025 Findings*) trên tập dữ liệu **Stanceosaurus** (*EMNLP 2022*).
+
+### ⚖️ NGUYÊN TẮC CÔNG BẰNG (FAIR BENCHMARK PROTOCOL):
+1. **Cùng Backbone:** Sử dụng cùng backbone `vinai/bertweet-base` với mô hình đối thủ Stanceosaurus Baseline (thay vì dùng BERT-base thông thường), triệt tiêu sự chênh lệch do pretrained domain knowledge Twitter.
+2. **Cùng Tập Dữ Liệu & Split:** Dùng chung 100% các tập Train/Dev/Test (`Train_final.xlsx`, `Dev_final.xlsx`, `Test_final.xlsx`) với phân chia Unseen Claims nghiêm ngặt.
+3. **Cùng Hệ Thống Nhãn:** Chuẩn hóa về 3 nhãn (*Supporting: 0, Refuting: 1, Other: 2*).
+4. **Cùng Metric Đánh Giá:** Đo lường Macro-F1, Accuracy, và Per-class F1 trên tập Test Zero-shot.
+
+### 💡 CƠ CHẾ CHẠY TEST NHANH VÀ TREO MÁY QUA ĐÊM:
+- **Chạy thử siêu tốc (Smoke Test):** Đặt `DEBUG_MODE = True` ở Cell 2. Code sẽ chỉ nạp mẫu nhỏ cân bằng và chạy 1 epoch trong ~30-45 giây để xác nhận toàn bộ pipeline hoạt động trơn tru.
+- **Treo máy qua đêm:** Đổi thành `DEBUG_MODE = False`, sau đó nhấn **Save Version** -> **Save & Run All (Commit)** trên Kaggle.
+
+=== Cell 1 [code] ===
+# ==============================================================================
+# STEP 1: CÀI ĐẶT THƯ VIỆN & TỰ ĐỘNG DÒ TÌM ĐƯỜNG DẪN DỮ LIỆU
+# ==============================================================================
+!pip install -q transformers openpyxl emoji python-box scikit-learn
+
+import os
+import glob
+import math
+import random
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torch.optim import AdamW
+from transformers import AutoTokenizer, AutoModel, get_linear_schedule_with_warmup
+from sklearn.metrics import classification_report, f1_score, accuracy_score
+from tqdm.auto import tqdm
+from box import Box
+
+# Tự động dò tìm thư mục dữ liệu trên Kaggle hoặc Local
+found_files = glob.glob('/kaggle/input/**/Train_final.xlsx', recursive=True) + \
+              glob.glob('./**/Train_final.xlsx', recursive=True) + \
+              glob.glob('d:/Khóa Luận Tốt Nghiệp/**/Train_final.xlsx', recursive=True)
+
+if not found_files:
+    raise FileNotFoundError('❌ Không tìm thấy Train_final.xlsx! Hãy kiểm tra Input Dataset trên Kaggle.')
+
+DATA_DIR = os.path.dirname(found_files[0])
+print(f'--> ✅ Đã kết nối dữ liệu Stanceosaurus tại: {DATA_DIR}')
+
+
+=== Cell 2 [code] ===
+# ==============================================================================
+# STEP 2: CẤU HÌNH SIÊU THAM SỐ (CÙNG BACKBONE BERTWEET ĐỂ SO SÁNH CÔNG BẰNG)
+# ==============================================================================
+DEBUG_MODE = False  # <-- ĐỔI THÀNH False KHI MUỐN TREO MÁY QUA ĐÊM!
+
+config = Box({
+    'data_dir': DATA_DIR,
+    'debug_mode': DEBUG_MODE,
+    'debug_samples_per_class': 40,        # Lấy đều mỗi lớp 40 mẫu khi Debug
+    'model_name': 'vinai/bertweet-base',  # Đồng bộ chính xác backbone BERTweet
+    'num_classes': 3,                     # 3: Supporting, Refuting, Other
+    'max_seq_len': 128,                   # BERTweet giới hạn cứng 130 (128 + 2 special tokens)
+    'batch_size': 8,                      # Batch size số lượng hội thoại
+    'accum_steps': 2,                     # Tích lũy gradient
+    'learning_rate': 2e-5,                # Đồng bộ lr với baseline
+    'weight_decay': 0.01,
+    'num_epochs': 1 if DEBUG_MODE else 6, # 1 epoch khi test, 6 epoch khi train full
+    'warmup_ratio': 0.1,
+    'gru_hidden': 768,
+    'gru_layer': 1,
+    'alpha': 0.5,                         # Trọng số Target Contrastive Loss (TCL)
+    'tau': 0.1,                           # Temperature cho Contrastive Loss
+    'att_temp': 1.0,                      # Temperature cho Attention tương tác
+    'use_amp': True,                      # Mixed Precision FP16
+    'seed': 42,
+    'output_dir': './',
+    'best_model_path': './best_sitpcl_bertweet_stanceosaurus.pt'
+})
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+set_seed(config.seed)
+config.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+
+if config.debug_mode:
+    print('⚠️ CHẾ ĐỘ ĐANG BẬT: [DEBUG MODE] - Chạy thử mẫu nhỏ trong 30-45 giây!')
+else:
+    print('🔥 CHẾ ĐỘ ĐANG BẬT: [FULL TRAINING] - Chạy toàn bộ dữ liệu qua đêm!')
+print(f'--> 🚀 Thiết bị: {config.device} | Epochs: {config.num_epochs} | Model Backbone: {config.model_name}')
+
+
+=== Cell 3 [code] ===
+# ==============================================================================
+# STEP 3: NẠP VÀ CHUYỂN ĐỔI THÀNH DỮ LIỆU HỘI THOẠI (DIALOGUE CONTEXT)
+# ==============================================================================
+def map_stance_labels(annotation, leaning, num_classes=3):
+    ann = str(annotation).strip()
+    lea = str(leaning).strip()
+    if num_classes == 5:
+        mapping = {'Supporting': 0, 'Refuting': 1, 'Discussing': 2, 'Querying': 3, 'Irrelevant': 4}
+        return mapping.get(ann, 4)
+    else:
+        combined = f'{ann} {lea}'.strip()
+        if ann == 'Supporting' or combined == 'Discussing Supporting':
+            return 0
+        elif ann == 'Refuting' or combined == 'Discussing Refuting':
+            return 1
+        else:
+            return 2
+
+def load_dialogue_dataframe(filename, num_classes=3):
+    file_path = os.path.join(config.data_dir, filename)
+    df = pd.read_excel(file_path)
+    df.columns = [
+        'number', 'date', 'status_id', 'in_reply_to_id', 'username', 'meta_info',
+        'claim', 'text', 'context', 'title', 'final_annotation', 'final_leaning', 'note_3'
+    ]
+    df = df.fillna('')
+    
+    dialogues = []
+    for _, row in df.iterrows():
+        claim = str(row['claim']).strip()
+        text = str(row['text']).replace('\n', ' ').strip()
+        context = str(row['context']).replace('\n', ' ').strip()
+        title = str(row['title']).replace('\n', ' ').strip()
+        label = map_stance_labels(row['final_annotation'], row['final_leaning'], num_classes)
+        
+        # Xây dựng các lượt nói (utterances) và định danh người nói (speakers)
+        # Lượt 1: Context (tweet cha hoặc tiêu đề URL) -> Speaker 0
+        # Lượt 2: Text đang xét -> Speaker 1 (người phản hồi)
+        if context:
+            ctx_text = f'{context} </s> {title}'.strip(' </s>') if title else context
+            sentences = [ctx_text, text]
+            speakers = [0, 1]
+        else:
+            main_text = f'{text} </s> {title}'.strip(' </s>') if title else text
+            sentences = [main_text]
+            speakers = [0]
+            
+        dialogues.append({
+            'target': claim,
+            'sentences': sentences,
+            'speakers': speakers,
+            'label': label
+        })
+    return pd.DataFrame(dialogues)
+
+print('[*] Đang đọc và cấu trúc hóa dữ liệu hội thoại...')
+train_df = load_dialogue_dataframe('Train_final.xlsx', config.num_classes)
+dev_df = load_dialogue_dataframe('Dev_final.xlsx', config.num_classes)
+test_df = load_dialogue_dataframe('Test_final.xlsx', config.num_classes)
+
+# ------------------------------------------------------------------------------
+# ÁP DỤNG DEBUG MODE (LẤY MẪU CÂN BẰNG ĐẢM BẢO ĐỦ CÁC LỚP)
+# ------------------------------------------------------------------------------
+if config.debug_mode:
+    k = config.debug_samples_per_class
+    train_df = train_df.groupby('label', group_keys=False).apply(lambda x: x.sample(n=min(len(x), k), random_state=config.seed)).reset_index(drop=True)
+    dev_df = dev_df.groupby('label', group_keys=False).apply(lambda x: x.sample(n=min(len(x), max(k//2, 5)), random_state=config.seed)).reset_index(drop=True)
+    test_df = test_df.groupby('label', group_keys=False).apply(lambda x: x.sample(n=min(len(x), max(k//2, 5)), random_state=config.seed)).reset_index(drop=True)
+    print(f'⚠️ [DEBUG MODE] Đã trích mẫu: Train={len(train_df)}, Dev={len(dev_df)}, Test={len(test_df)}')
+else:
+    print(f'--> [FULL DATA] Train : {len(train_df):,} hội thoại | {train_df["target"].nunique()} targets')
+    print(f'--> [FULL DATA] Dev   : {len(dev_df):,} hội thoại | {dev_df["target"].nunique()} targets')
+    print(f'--> [FULL DATA] Test  : {len(test_df):,} hội thoại | {test_df["target"].nunique()} targets')
+
+label_names = ['Supporting', 'Refuting', 'Other']
+dist_df = pd.DataFrame({
+    'Train': train_df['label'].value_counts().sort_index(),
+    'Dev': dev_df['label'].value_counts().sort_index(),
+    'Test': test_df['label'].value_counts().sort_index()
+}, index=range(len(label_names)))
+dist_df.index = label_names
+display(dist_df)
+
+
+=== Cell 4 [code] ===
+# ==============================================================================
+# STEP 4: PROMPT TOKENIZATION CHO BERTWEET & DATALOADER
+# ==============================================================================
+tokenizer = AutoTokenizer.from_pretrained(config.model_name, use_fast=False)
+mask_token = tokenizer.mask_token  # '<mask>' cho BERTweet/RoBERTa
+mask_token_id = tokenizer.mask_token_id
+
+print(f'--> Tokenizer sử dụng mask token: "{mask_token}" (ID: {mask_token_id})')
+
+class SITPCLStanceDataset(Dataset):
+    def __init__(self, df, tokenizer, max_len=128):
+        self.tokenizer = tokenizer
+        self.max_len = max_len
+        self.data = df.to_dict('records')
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        item = self.data[idx]
+        sentences = item['sentences']
+        speakers = item['speakers']
+        target = item['target']
+        
+        utterances = []
+        for s_idx, sen in enumerate(sentences):
+            # Prompt chuẩn hóa cho BERTweet RoBERTa format:
+            # "In utterance: {sen} , user {spk} stance towards {target} is <mask>"
+            prompt = f'user {speakers[s_idx]} says: {sen} . Stance towards {target} is {mask_token}'
+            enc = self.tokenizer(
+                prompt,
+                max_length=self.max_len,
+                padding='max_length',
+                truncation=True,
+                return_tensors='pt'
+            )
+            input_ids = enc['input_ids'].squeeze(0)
+            att_mask = enc['attention_mask'].squeeze(0)
+            
+            # Xác định vị trí động của token <mask> (đảm bảo chuẩn xác tuyệt đối)
+            mask_indices = (input_ids == mask_token_id).nonzero(as_tuple=True)[0]
+            mask_idx = mask_indices[0].item() if len(mask_indices) > 0 else (att_mask.sum().item() - 2)
+            
+            utterances.append({
+                'input_ids': input_ids,
+                'attention_mask': att_mask,
+                'mask_idx': mask_idx
+            })
+            
+        return {
+            'utterances': utterances,
+            'speakers': speakers,
+            'target': target,
+            'label': torch.tensor(item['label'], dtype=torch.long)
+        }
+
+def sitpcl_collate_fn(batch):
+    all_input_ids = []
+    all_att_masks = []
+    all_mask_indices = []
+    dia_idx = []
+    speakers_list = []
+    targets_list = []
+    labels_list = []
+
+    curr_idx = 0
+    for sample in batch:
+        n_utts = len(sample['utterances'])
+        dia_idx.append((curr_idx, curr_idx + n_utts))
+        curr_idx += n_utts
+
+        for utt in sample['utterances']:
+            all_input_ids.append(utt['input_ids'])
+            all_att_masks.append(utt['attention_mask'])
+            all_mask_indices.append(utt['mask_idx'])
+
+        speakers_list.append(sample['speakers'])
+        targets_list.append(sample['target'])
+        labels_list.append(sample['label'])
+
+    return {
+        'input_ids': torch.stack(all_input_ids),
+        'attention_mask': torch.stack(all_att_masks),
+        'mask_indices': torch.tensor(all_mask_indices, dtype=torch.long),
+        'dia_idx': dia_idx,
+        'speakers': speakers_list,
+        'targets': targets_list,
+        'labels': torch.stack(labels_list)
+    }
+
+train_dataset = SITPCLStanceDataset(train_df, tokenizer, config.max_seq_len)
+dev_dataset = SITPCLStanceDataset(dev_df, tokenizer, config.max_seq_len)
+test_dataset = SITPCLStanceDataset(test_df, tokenizer, config.max_seq_len)
+
+train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, collate_fn=sitpcl_collate_fn)
+dev_loader = DataLoader(dev_dataset, batch_size=config.batch_size, shuffle=False, collate_fn=sitpcl_collate_fn)
+test_loader = DataLoader(test_dataset, batch_size=config.batch_size, shuffle=False, collate_fn=sitpcl_collate_fn)
+
+print('--> ✅ DataLoader SITPCL đã khởi tạo xong!')
+
+
+=== Cell 5 [code] ===
+# ==============================================================================
+# STEP 5: KIẾN TRÚC MÔ HÌNH SITPCL (ATTENTION, SSE & TARGET CONTRASTIVE LOSS)
+# ==============================================================================
+class Attention(nn.Module):
+    def __init__(self, hidden_dim, temperature=1.0):
+        super().__init__()
+        self.query_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.key_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.value_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.scale = hidden_dim ** -0.5
+        self.temperature = temperature
+        self.act = nn.Softmax(dim=-1)
+
+    def forward(self, query, keys, values):
+        if query.dim() == 1:
+            query = query.unsqueeze(0)
+        q = self.query_proj(query)
+        k = self.key_proj(keys)
+        v = self.value_proj(values)
+        attn_scores = (torch.matmul(q, k.transpose(-2, -1)) * self.scale) / self.temperature
+        attn_weights = self.act(attn_scores)
+        output = torch.matmul(attn_weights, v)
+        return output.squeeze(0) if output.size(0) == 1 else output
+
+class SpeakerStanceExtractor(nn.Module):
+    """Mô hình hóa tương tác người nói (Intra-speaker & Inter-speaker dependencies)"""
+    def __init__(self, hidden_dim=768, temperature=1.0):
+        super().__init__()
+        self.linear_intra = nn.Linear(hidden_dim * 2, hidden_dim)
+        self.linear_inter = nn.Linear(hidden_dim, hidden_dim)
+        self.attention_intra = Attention(hidden_dim, temperature=temperature)
+        self.attention_inter = Attention(hidden_dim, temperature=temperature)
+
+    def forward(self, utterances, speakers):
+        V_lst = []
+        last_speaker_idx = dict()
+        for i in range(len(speakers)):
+            spk = speakers[i]
+            if spk not in last_speaker_idx:
+                V_lst.append(utterances[i])
+            else:
+                prev_idx = last_speaker_idx[spk]
+                vh_concat = torch.cat((V_lst[prev_idx], utterances[i]), dim=-1)
+                q_intra = self.linear_intra(vh_concat)
+                c = utterances[:i+1]
+                v_intra = self.attention_intra(q_intra, c, c)
+
+                q_inter = self.linear_inter(utterances[i])
+                k = torch.stack([V_lst[j] for j in range(prev_idx, i)]) if i > prev_idx else utterances[i].unsqueeze(0)
+                v_inter = self.attention_inter(q_inter, k, k) if len(k) > 0 else torch.zeros_like(q_inter)
+
+                V_lst.append(v_intra + v_inter)
+            last_speaker_idx[spk] = i
+        return torch.stack(V_lst)
+
+def target_contrastive_loss(H_final, targets, tau=0.1):
+    """Target Contrastive Loss (TCL) cho biểu diễn Zero-Shot Target"""
+    B = len(H_final)
+    if B <= 1:
+        return torch.tensor(0.0, device=H_final[0].device)
+    
+    embeddings = torch.stack([F.normalize(h[-1], p=2, dim=-1) for h in H_final])  # [B, hidden_dim]
+    sim_matrix = torch.matmul(embeddings, embeddings.T) / tau                    # [B, B]
+    
+    loss = 0.0
+    valid_comparisons = 0
+    for i in range(B):
+        pos_mask = [1 if targets[i] == targets[j] and i != j else 0 for j in range(B)]
+        if sum(pos_mask) > 0:
+            numerator = torch.exp(sim_matrix[i, torch.tensor(pos_mask, dtype=torch.bool, device=embeddings.device)])
+            denominator = torch.sum(torch.exp(sim_matrix[i, [j for j in range(B) if j != i]]))
+            loss += -torch.log(numerator.sum() / (denominator + 1e-8))
+            valid_comparisons += 1
+            
+    if valid_comparisons == 0:
+        return torch.tensor(0.0, device=embeddings.device)
+    return loss / valid_comparisons
+
+class SITPCLBERTweetModel(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.backbone = AutoModel.from_pretrained(config.model_name)
+        hidden_size = self.backbone.config.hidden_size
+        self.gru = nn.GRU(input_size=hidden_size, hidden_size=config.gru_hidden, num_layers=config.gru_layer, batch_first=True)
+        self.sse = SpeakerStanceExtractor(hidden_dim=config.gru_hidden, temperature=config.att_temp)
+        self.classifier = nn.Sequential(
+            nn.Dropout(0.2),
+            nn.Linear(config.gru_hidden, config.num_classes)
+        )
+        self.ce_criterion = nn.CrossEntropyLoss()
+
+    def forward(self, input_ids, attention_mask, mask_indices, dia_idx, speakers, targets, labels=None):
+        # Truyền qua BERTweet (không có token_type_ids cho RoBERTa)
+        outputs = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
+        last_hidden = outputs.last_hidden_state  # [total_utts, seq_len, hidden_size]
+        
+        # Trích xuất vector biểu diễn tại đúng vị trí token <mask>
+        batch_indices = torch.arange(last_hidden.size(0), device=last_hidden.device)
+        mask_reps = last_hidden[batch_indices, mask_indices, :]  # [total_utts, hidden_size]
+        
+        H_final = []
+        dialogue_representations = []
+        for d_id, (st, ed) in enumerate(dia_idx):
+            d_reps = mask_reps[st:ed] # [num_utts_in_dia, hidden_size]
+            o, _ = self.gru(d_reps.unsqueeze(0))
+            o = o.squeeze(0)
+            v = self.sse(o, speakers[d_id])
+            H_final.append(v)
+            dialogue_representations.append(v[-1]) # Lấy phát ngôn phản hồi cuối cùng
+            
+        stance_features = torch.stack(dialogue_representations)
+        logits = self.classifier(stance_features)
+        
+        loss = None
+        if labels is not None:
+            ce_loss = self.ce_criterion(logits, labels)
+            cl_loss = target_contrastive_loss(H_final, targets, tau=self.config.tau)
+            loss = ce_loss + self.config.alpha * cl_loss
+            
+        return loss, logits
+
+model = SITPCLBERTweetModel(config).to(config.device)
+print('--> ✅ Đã khởi tạo thành công kiến trúc SITPCL trên Backbone BERTweet!')
+
+
+=== Cell 6 [code] ===
+# ==============================================================================
+# STEP 6: THIẾT LẬP OPTIMIZER & SCHEDULER
+# ==============================================================================
+optimizer = AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
+total_steps = (len(train_loader) // config.accum_steps) * config.num_epochs
+warmup_steps = int(total_steps * config.warmup_ratio)
+scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps, num_training_steps=max(total_steps, 1))
+scaler = torch.cuda.amp.GradScaler(enabled=config.use_amp)
+
+print(f'--> ✅ Tổng số bước huấn luyện SITPCL: {total_steps} (Warmup: {warmup_steps})')
+
+
+=== Cell 7 [code] ===
+# ==============================================================================
+# STEP 7: VÒNG LẶP HUẤN LUYỆN VÀ VALIDATION
+# ==============================================================================
+def evaluate_sitpcl(model, loader, target_names):
+    model.eval()
+    all_preds, all_labels = [], []
+    cls_list = list(range(len(target_names)))
+    
+    with torch.no_grad():
+        for batch in loader:
+            input_ids = batch['input_ids'].to(config.device)
+            attention_mask = batch['attention_mask'].to(config.device)
+            mask_indices = batch['mask_indices'].to(config.device)
+            labels = batch['labels'].to(config.device)
+
+            with torch.cuda.amp.autocast(enabled=config.use_amp):
+                _, logits = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    mask_indices=mask_indices,
+                    dia_idx=batch['dia_idx'],
+                    speakers=batch['speakers'],
+                    targets=batch['targets'],
+                    labels=labels
+                )
+            preds = torch.argmax(logits, dim=1).cpu().numpy()
+            all_preds.extend(preds)
+            all_labels.extend(labels.cpu().numpy())
+
+    macro_f1 = f1_score(all_labels, all_preds, labels=cls_list, average='macro', zero_division=0)
+    acc = accuracy_score(all_labels, all_preds)
+    per_class_f1 = f1_score(all_labels, all_preds, labels=cls_list, average=None, zero_division=0)
+    report = classification_report(all_labels, all_preds, labels=cls_list, target_names=target_names, zero_division=0, output_dict=True)
+    return macro_f1, acc, per_class_f1, report
+
+best_dev_f1 = 0.0
+history = []
+best_model_path = config.best_model_path
+
+print('\n[*] BẮT ĐẦU TRAINING SITPCL (BERTWEET BACKBONE)...')
+for epoch in range(1, config.num_epochs + 1):
+    model.train()
+    total_loss = 0.0
+    optimizer.zero_grad()
+
+    loop = tqdm(train_loader, desc=f'Epoch {epoch}/{config.num_epochs}')
+    for step, batch in enumerate(loop):
+        input_ids = batch['input_ids'].to(config.device)
+        attention_mask = batch['attention_mask'].to(config.device)
+        mask_indices = batch['mask_indices'].to(config.device)
+        labels = batch['labels'].to(config.device)
+
+        with torch.cuda.amp.autocast(enabled=config.use_amp):
+            loss, _ = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                mask_indices=mask_indices,
+                dia_idx=batch['dia_idx'],
+                speakers=batch['speakers'],
+                targets=batch['targets'],
+                labels=labels
+            )
+            loss = loss / config.accum_steps
+
+        scaler.scale(loss).backward()
+        total_loss += loss.item() * config.accum_steps
+
+        if (step + 1) % config.accum_steps == 0 or (step + 1) == len(train_loader):
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
+            scheduler.step()
+
+        loop.set_postfix(loss=total_loss / (step + 1))
+
+    avg_train_loss = total_loss / len(train_loader)
+    dev_f1, dev_acc, dev_per_f1, _ = evaluate_sitpcl(model, dev_loader, label_names)
+    
+    print(f'--> [Epoch {epoch}] Train Loss: {avg_train_loss:.4f} | Dev Macro-F1: {dev_f1*100:.2f}% | Dev Acc: {dev_acc*100:.2f}%')
+    history.append({'epoch': epoch, 'train_loss': avg_train_loss, 'dev_macro_f1': dev_f1, 'dev_acc': dev_acc})
+    
+    if dev_f1 >= best_dev_f1:
+        best_dev_f1 = dev_f1
+        torch.save(model.state_dict(), best_model_path)
+        print(f'    🏆 [Lưu Checkpoint Tốt Nhất] Dev F1 đạt: {best_dev_f1*100:.2f}%')
+
+
+=== Cell 8 [code] ===
+# ==============================================================================
+# STEP 8: ĐÁNH GIÁ TRÊN TẬP TEST ZERO-SHOT & XUẤT BẢNG KẾT QUẢ ĐỐI SOÁT
+# ==============================================================================
+print('\n' + '='*75)
+print('[*] ĐÁNH GIÁ SITPCL TRÊN TẬP TEST ZERO-SHOT VỚI CHECKPOINT TỐT NHẤT')
+print('='*75)
+
+best_model_path = getattr(config, 'best_model_path', './best_sitpcl_bertweet_stanceosaurus.pt')
+
+if os.path.exists(best_model_path):
+    model.load_state_dict(torch.load(best_model_path, map_location=config.device))
+    print(f'--> [✓] Đã nạp thành công checkpoint tốt nhất từ: {best_model_path}')
+else:
+    print('--> [!] Không tìm thấy file checkpoint đã lưu, sử dụng trọng số hiện tại của model.')
+
+test_f1, test_acc, test_per_f1, test_report_dict = evaluate_sitpcl(model, test_loader, label_names)
+
+# Tạo bảng kết quả chuẩn hóa đồng nhất cột với baseline BERTweet
+res_dict = {
+    'Model': 'SITPCL (BERTweet Backbone)',
+    'Mode': 'DEBUG' if config.debug_mode else 'FULL',
+    'Num_Classes': config.num_classes,
+    'Loss_Type': f'CE + {config.alpha}*TCL',
+    'Accuracy': round(test_acc * 100, 2),
+    'Macro_F1': round(test_f1 * 100, 2)
+}
+
+for idx, name in enumerate(label_names):
+    if idx < len(test_per_f1):
+        res_dict[f'F1_{name}'] = round(test_per_f1[idx] * 100, 2)
+
+results_df = pd.DataFrame([res_dict])
+results_df.to_csv('stanceosaurus_sitpcl_results.csv', index=False)
+
+print('\n--- 📊 BẢNG KẾT QUẢ SITPCL (BERTWEET) ĐỂ ĐỐI SOÁT CÔNG BẰNG ---')
+display(results_df)
+
+report_df = pd.DataFrame(test_report_dict).T
+print('\n--- Báo Cáo Phân Loại Chi Tiết Từng Nhãn ---')
+display(report_df.round(3))
+
+# Đọc kết quả của Baseline để so sánh trực tiếp nếu có sẵn
+baseline_csv = 'stanceosaurus_bertweet_results.csv'
+if os.path.exists(baseline_csv):
+    print('\n' + '='*75)
+    print('🔥 BẢNG ĐỐI SÁNH CÔNG BẰNG GIỮA CÁC ĐỐI THỦ TRÊN STANCEOSAURUS:')
+    print('='*75)
+    b_df = pd.read_csv(baseline_csv)
+    compare_df = pd.concat([b_df, results_df], ignore_index=True)
+    display(compare_df)
+
+if config.debug_mode:
+    print('\n🎉 [XÁC NHẬN] CHẾ ĐỘ DEBUG ĐÃ CHẠY THÀNH CÔNG!')
+    print('👉 BẠN CHỈ CẦN QUAY LẠI CELL 2, ĐỔI `DEBUG_MODE = False`, RỒI COMMIT TREO QUA ĐÊM TRÊN KAGGLE!')
+else:
+    print('\n✅ [HOÀN TẤT] ĐÃ CHẠY XONG FULL DỮ LIỆU SITPCL TRÊN BERTWEET!')
+
+
+=== Cell 9 [code] ===
+
+

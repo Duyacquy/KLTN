@@ -1,0 +1,16 @@
+English Train:
+python process.py --data_file=Train_final.xlsx --normalize=True --number_labels=5 --username_replacement=@USER --website_replacement=HTTPURL --separation_token=[SEP] --language=english
+
+English Development:
+python process.py --data_file=Dev_final.xlsx --normalize=True --number_labels=5 --username_replacement=@USER --website_replacement=HTTPURL --separation_token=[SEP] --language=english
+
+English Test:
+python process.py --data_file=Test_final.xlsx --normalize=True --number_labels=5 --username_replacement=@USER --website_replacement=HTTPURL --separation_token=[SEP] --language=english
+
+Arabic data:
+python process.py --data_file=Arabic_final.xlsx --normalize=True --number_labels=5 --username_replacement=@USER --website_replacement=HTTPURL --separation_token=[SEP] --language=arabic
+
+Hindi data:
+python process.py --data_file=Hindi_final.xlsx --normalize=True --number_labels=5 --username_replacement=@USER --website_replacement=HTTPURL --separation_token=[SEP] --language=hindi
+
+

@@ -1,0 +1,526 @@
+=== Cell 0 [code] ===
+!pip install python-box transformers scikit-learn tqdm
+
+import os
+import glob
+
+# Tự động quét tìm dataset trong /kaggle/input/
+found_train = glob.glob("/kaggle/input/**/train_data.json", recursive=True)
+if not found_train:
+    raise FileNotFoundError("Không tìm thấy train_data.json! Hãy kiểm tra lại dataset ở tab Input bên phải.")
+
+DATA_DIR = os.path.dirname(found_train[0])
+print(f"--> Đã kết nối dữ liệu tại: {DATA_DIR}")
+!ls -lh "{DATA_DIR}"
+
+=== Cell 1 [code] ===
+from box import Box
+import torch
+from datetime import datetime
+
+config = Box({
+    # Đường dẫn dữ liệu
+    "train_path": os.path.join(DATA_DIR, "train_data.json"),
+    "dev_path": os.path.join(DATA_DIR, "dev_data.json"),
+    "test_path": os.path.join(DATA_DIR, "test_data.json"),
+
+    # Backbone PLM
+    "plm": "roberta",
+    "bert_dir": "hfl/chinese-roberta-wwm-ext",
+
+    # Siêu tham số cơ sở
+    "epoch_size": 20,
+    "batchsize": 16,
+    "bert_lr": 1e-5,
+    "other_lr": 1e-5,
+    "weight_decay": 1e-6,
+    "warmup_steps": 0,
+    "adam_epsilon": 1e-8,
+    "max_grad_norm": 1.0,
+    "gru_layer": 1,
+    "gru_hidden": 768,
+    "hidden_size": 768,
+    "num_classes": 3,
+    "alpha": 1.0,               # Trọng số Target Contrastive Loss (TPCL)
+    "tau": 0.1,                 # Nhiệt độ TPCL
+    "seed": 1234,
+    "cuda_index": 0,
+
+    # === CẤU HÌNH FOCUSED TRANSFORMER (FoT) ===
+    "use_fot": True,            # Bật học tương phản Attention Query/Key
+    "beta": 0.5,                # Trọng số FoT Loss (Loss = CE + alpha*TPCL + beta*FoT)
+    "tau_fot": 0.1,             # Nhiệt độ InfoNCE trong FoT
+    "use_sparsemax": True,     # True nếu muốn kết hợp cả Sparsemax + FoT
+
+    # === CHẾ ĐỘ THỬ NGHIỆM ===
+    "debug": False,              # True: Test 30 mẫu trong vài chục giây | False: Chạy full qua đêm
+    "model_type": "SITPCL_FoT",
+    "time": datetime.now().strftime("%Y%m%d_%H%M%S")
+})
+
+config.device = torch.device(f"cuda:{config.cuda_index}" if torch.cuda.is_available() else "cpu")
+print(f"Thiết bị: {config.device} | Mô hình: {config.model_type} | FoT: {config.use_fot} (beta={config.beta}) | Debug: {config.debug}")
+
+=== Cell 2 [code] ===
+import random
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+def set_seed(seed):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    os.environ['PYTHONHASHSEED'] = str(seed)
+
+def map_sequence(input_list):
+    num_to_order = {}
+    order = 0
+    result = []
+    for num in input_list:
+        if num not in num_to_order:
+            num_to_order[num] = order
+            order += 1
+        result.append(num_to_order[num])
+    return result
+
+def compute_target_prototypes(H_lst, new_target, num_classes):
+    prototypes = []
+    vectors = []
+    labels = []
+    for c in range(num_classes):
+        prototype = []
+        for i in range(len(new_target)):
+            if new_target[i] == c:
+                prototype.extend([utt for utt in H_lst[i]])
+                vectors.extend([utt for utt in H_lst[i]])
+                labels.extend([c for utt in H_lst[i]])
+        if prototype:
+            prototype = torch.stack(prototype).mean(dim=0)
+        else:
+            prototype = torch.zeros_like(H_lst[0][0])
+        prototypes.append(prototype)
+    return torch.stack(prototypes), torch.stack(vectors), torch.tensor(labels)
+
+def target_CL(H_lst, target, config):
+    tar_dic = {}
+    tmp = 0
+    for t in target:
+        if t not in tar_dic:
+            tar_dic[t] = tmp
+            tmp += 1
+    new_target = [tar_dic[t] for t in target]
+    num_classes = tmp
+    prototypes, vectors, labels = compute_target_prototypes(H_lst, new_target, num_classes)
+    vectors = F.normalize(vectors, p=2, dim=-1)
+    prototypes = F.normalize(prototypes, dim=-1)
+    similarities = torch.mm(vectors, prototypes.T) / config.tau
+    labels = labels.to(config.device)
+    loss = F.cross_entropy(similarities, labels)
+    return loss
+
+=== Cell 3 [code] ===
+import json
+from transformers import AutoTokenizer
+from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
+
+class MyDataset(Dataset):
+    def __init__(self, data):
+        self.data = data
+    def __len__(self):
+        return len(self.data)
+    def __getitem__(self, index):
+        return self.data[index]
+
+class DataProcessor():
+    def __init__(self, config):
+        self.tokenizer = AutoTokenizer.from_pretrained(config.bert_dir)
+        self.config = config
+    
+    def read_data(self, mode):
+        file_path = getattr(self.config, f"{mode}_path")
+        content = json.load(open(file_path, 'r', encoding='utf-8'))
+        
+        if getattr(self.config, 'debug', False):
+            content = content[:30]
+            
+        res = []
+        for line in tqdm(content, desc=f'Processing dialogues for {mode}'):
+            res.append(self.parse_dialogue(line, mode))
+        return res
+    
+    def parse_dialogue(self, dialogue, mode):
+        new_sentences = []
+        new_label_sen = []
+        target_indices = []
+        target = dialogue["target"]
+        speakers = dialogue["speakers"]
+        for id, sen in enumerate(dialogue['sentences']):
+            new_sen = f'[CLS]在话语“{sen}”中，用户{speakers[id]}对[SEP]{target}[SEP]的立场为[MASK][SEP]'
+            if id == len(dialogue['sentences']) - 1:
+                label_sen = f'[CLS]在话语“{sen}”中，用户{speakers[id]}对[SEP]{target}[SEP]的立场为{dialogue["label"]}[SEP]'
+                new_label_sen.append(self.tokenizer.tokenize(label_sen))
+            tokens = self.tokenizer.tokenize(new_sen)
+            new_sentences.append(tokens)
+            sep_indices = [i for i, token in enumerate(tokens) if token == '[SEP]']
+            target_indices.append([sep_indices[0] + 1, sep_indices[1]])
+            
+        dialogue['sentences'] = new_sentences
+        dialogue['label_sen'] = new_label_sen
+        dialogue['target_idx'] = target_indices
+        dialogue['target_type'] = dialogue.get('target_type', 'n')
+        return dialogue
+    
+    def transform2indices(self, data):
+        res = []
+        for doc in data:
+            input_ids = list(map(self.tokenizer.convert_tokens_to_ids, doc['sentences']))
+            input_masks = [[1] * len(w) for w in input_ids]
+            input_segments = [[0] * len(w) for w in input_ids]
+            input_ids_label = list(map(self.tokenizer.convert_tokens_to_ids, doc['label_sen']))
+            input_masks_label = [[1] * len(w) for w in input_ids_label]
+            input_segments_label = [[0] * len(w) for w in input_ids_label]
+            res.append((
+                input_ids, input_masks, input_segments, doc['speakers'], doc['label'],
+                doc['target_idx'], doc['target'], input_ids_label, input_masks_label, input_segments_label,
+                doc['id'], doc['target_type']
+            ))
+        return res
+    
+    def collate_fn_new(self, batch):
+        (
+            input_ids, input_masks, input_segments, speakers, label,
+            target_idx, target, input_ids_label, input_masks_label, input_segments_label,
+            doc_id, target_type
+        ) = zip(*batch)
+        
+        dialogue_length = list(map(len, input_ids))
+        st = 0
+        dia_idx = []
+        for num in dialogue_length:
+            dia_idx.append([st, st + num])
+            st += num
+            
+        max_lens = max(len(w) for sublist in input_ids for w in sublist)
+        padding = lambda batch_seq: [w + [0] * (max_lens - len(w)) for sublist in batch_seq for w in sublist]
+        input_ids, input_masks, input_segments = map(padding, [input_ids, input_masks, input_segments])
+        
+        max_lens_label = max(len(w) for sublist in input_ids_label for w in sublist)
+        padding_label = lambda batch_seq: [w + [0] * (max_lens_label - len(w)) for sublist in batch_seq for w in sublist]
+        input_ids_label, input_masks_label, input_segments_label = map(padding_label, [input_ids_label, input_masks_label, input_segments_label]) 
+        
+        return {
+            "input_ids": torch.tensor(input_ids).to(self.config.device),
+            "input_masks": torch.tensor(input_masks).to(self.config.device),
+            "input_segments": torch.tensor(input_segments).to(self.config.device),
+            "speakers": speakers,
+            "label": torch.tensor(label).to(self.config.device),
+            "dia_idx": dia_idx,
+            "target_idx": target_idx,
+            "target": target,
+            "input_ids_label": torch.tensor(input_ids_label).to(self.config.device),
+            "input_masks_label": torch.tensor(input_masks_label).to(self.config.device),
+            "input_segments_label": torch.tensor(input_segments_label).to(self.config.device),
+            "doc_id": doc_id,
+            "target_type": list(target_type)
+        }
+    
+    def get_data(self):
+        train_dataset = MyDataset(self.transform2indices(self.read_data('train')))
+        dev_dataset = MyDataset(self.transform2indices(self.read_data('dev')))
+        test_dataset = MyDataset(self.transform2indices(self.read_data('test')))
+            
+        train_loader = DataLoader(train_dataset, batch_size=self.config.batchsize, shuffle=True, collate_fn=self.collate_fn_new)
+        dev_loader = DataLoader(dev_dataset, batch_size=self.config.batchsize, shuffle=False, collate_fn=self.collate_fn_new)
+        test_loader = DataLoader(test_dataset, batch_size=self.config.batchsize, shuffle=False, collate_fn=self.collate_fn_new)
+        return train_loader, dev_loader, test_loader
+
+=== Cell 4 [code] ===
+from transformers import AutoModel
+
+class Attention(nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.query_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.key_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.value_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.scale = hidden_dim ** -0.5
+
+    def forward(self, query, keys, values):
+        if query.dim() == 1:
+            query = query.unsqueeze(0)
+        q = self.query_proj(query)         # (B, D)
+        k = self.key_proj(keys)            # (L, D)
+        v = self.value_proj(values)        # (L, D)
+        
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        attn_weights = torch.softmax(attn_scores, dim=-1)
+        output = torch.matmul(attn_weights, v)
+        out = output.squeeze(0) if output.size(0) == 1 else output
+        return out, q.squeeze(0), k        # Trả về q và k để tính FoT Contrastive Loss
+
+class SSE_FoT(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        hidden_dim = config.gru_hidden
+        self.linear_intra = nn.Linear(hidden_dim * 2, hidden_dim)
+        self.linear_inter = nn.Linear(hidden_dim, hidden_dim)
+        self.attention_intra = Attention(hidden_dim)
+        self.attention_inter = Attention(hidden_dim)
+        self.tau_fot = getattr(config, 'tau_fot', 0.1)
+
+    def forward(self, utterances, speakers):
+        device = utterances.device
+        speakers_mapped = torch.tensor(map_sequence(speakers), device=device)
+        V_lst = []
+        last_speaker_idx = dict()
+        fot_losses = []
+
+        for i in range(len(speakers_mapped)):
+            speaker_id = speakers_mapped[i].item()
+            if speaker_id not in last_speaker_idx:
+                V_lst.append(utterances[i])
+            else:
+                prev_idx = last_speaker_idx[speaker_id]
+                vh_concat = torch.cat((V_lst[prev_idx], utterances[i]), dim=-1)
+                q_intra = self.linear_intra(vh_concat)
+                c = utterances[:i+1]
+                
+                # Attention với trích xuất vector q, k
+                v_intra, q_vec, k_mat = self.attention_intra(q_intra, c, c)
+
+                # ==========================================================
+                # TÍNH TOÁN FOCUSED TRANSFORMER (FoT) CONTRASTIVE LOSS
+                # ==========================================================
+                if self.training and getattr(self.config, 'use_fot', True):
+                    # Positive keys: Các lượt thoại trong quá khứ do CÙNG người nói phát ngôn (j < i)
+                    hist_speakers = speakers_mapped[:i+1]
+                    pos_mask = (hist_speakers == speaker_id)
+                    pos_mask[i] = False  # Bỏ qua chính lượt thoại hiện tại
+                    
+                    # Negative keys: Các lượt thoại do người đối thoại KHÁC phát ngôn
+                    neg_mask = (hist_speakers != speaker_id)
+
+                    if pos_mask.any() and neg_mask.any():
+                        # Chuẩn hóa L2 trước khi tính tương đồng cosine theo nguyên lý Contrastive Learning
+                        q_norm = F.normalize(q_vec.unsqueeze(0), p=2, dim=-1)  # (1, D)
+                        k_norm = F.normalize(k_mat, p=2, dim=-1)               # (i+1, D)
+                        
+                        sim = torch.matmul(q_norm, k_norm.T).squeeze(0) / self.tau_fot  # (i+1,)
+                        pos_sim = sim[pos_mask]
+                        all_sim = sim[pos_mask | neg_mask]
+                        
+                        # InfoNCE Loss: Kéo gần cùng speaker, đẩy xa speaker khác
+                        step_fot_loss = - (torch.logsumexp(pos_sim, dim=0) - torch.logsumexp(all_sim, dim=0))
+                        fot_losses.append(step_fot_loss)
+
+                # 2. Inter-speaker Attention (Giữ nguyên luồng tương tác giữa các người nói)
+                q_inter = self.linear_inter(utterances[i])
+                k = torch.stack([V_lst[j] for j in range(prev_idx, i)]) if i > prev_idx else utterances[i].unsqueeze(0)
+                v_inter, _, _ = self.attention_inter(q_inter, k, k) if len(k) > 0 else (torch.zeros_like(q_inter), None, None)
+
+                V_lst.append(v_intra + v_inter)
+                
+            last_speaker_idx[speaker_id] = i
+
+        total_fot_loss = torch.stack(fot_losses).mean() if len(fot_losses) > 0 else torch.tensor(0.0, device=device)
+        return torch.stack(V_lst), total_fot_loss
+
+class SITCL(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.alpha = config.alpha
+        self.beta = getattr(config, 'beta', 0.5)
+        self.bert = AutoModel.from_pretrained(config.bert_dir)
+        self.gru = nn.GRU(input_size=768, hidden_size=config.gru_hidden, num_layers=config.gru_layer, batch_first=True)
+        self.fc = nn.Linear(config.gru_hidden, config.num_classes)
+        self.criterion = nn.CrossEntropyLoss()
+        self.SSE = SSE_FoT(config)
+
+    def forward(self, **kwargs):
+        input_ids = kwargs['input_ids']
+        input_masks = kwargs['input_masks']
+        input_segments = kwargs['input_segments']
+        speakers = kwargs['speakers']
+        label = kwargs['label']
+        dia_idx = kwargs['dia_idx']
+        targets = kwargs['target']
+
+        out = self.bert(input_ids=input_ids, attention_mask=input_masks, token_type_ids=input_segments).last_hidden_state
+
+        H_final = []
+        stance = []
+        batch_fot_losses = []
+
+        for dia_id, (st, ed) in enumerate(dia_idx):
+            h = out[st:ed, -2, :] # Token [MASK]
+            o, _ = self.gru(h.unsqueeze(0))
+            o = o.squeeze(0)
+            v, dia_fot_loss = self.SSE(o, speakers[dia_id])
+            H_final.append(v)
+            stance.append(v[-1])
+            if self.training and dia_fot_loss > 0:
+                batch_fot_losses.append(dia_fot_loss)
+            
+        stance = torch.stack(stance)
+        logits = self.fc(stance)
+        ce_loss = self.criterion(logits, label)
+        
+        # 1. Target Contrastive Loss (Vĩ mô)
+        target_contrastive_loss = target_CL(H_final, targets, self.config)
+        
+        # 2. FoT Attention Contrastive Loss (Vi mô)
+        fot_loss = torch.stack(batch_fot_losses).mean() if len(batch_fot_losses) > 0 else torch.tensor(0.0, device=self.config.device)
+        
+        # TỔNG HÀM MẤT MÁT KÉP (Dual Contrastive Objective)
+        total_loss = ce_loss + self.alpha * target_contrastive_loss + self.beta * fot_loss
+        return total_loss, logits, label
+
+=== Cell 5 [code] ===
+import pandas as pd
+from torch.optim import AdamW
+from transformers import get_linear_schedule_with_warmup
+from sklearn.metrics import f1_score, accuracy_score
+
+class Trainer:
+    def __init__(self, config):
+        self.config = config
+        set_seed(self.config.seed)
+        
+        prefix = "debug_" if self.config.debug else ""
+        self.save_dir = f"./result/{prefix}{self.config.model_type}_{self.config.time}/save/"
+        self.pred_file = f"./result/{prefix}{self.config.model_type}_{self.config.time}/pred_{self.config.seed}.csv"
+        os.makedirs(self.save_dir, exist_ok=True)
+        os.makedirs(os.path.dirname(self.pred_file), exist_ok=True)
+        
+        self.best_dev_f1 = -1.0
+
+    def calc_group_metrics(self, y_true, y_pred):
+        if len(y_true) == 0:
+            return 0.0, 0.0, 0.0, 0.0
+        f1_per_class = f1_score(y_true, y_pred, average=None, labels=[0, 1, 2], zero_division=0)
+        macro_f1 = f1_score(y_true, y_pred, average='macro', zero_division=0)
+        return f1_per_class[0] * 100, f1_per_class[1] * 100, f1_per_class[2] * 100, macro_f1 * 100
+
+    def print_paper_comparison_table(self, trues, preds, target_types, epoch_info="BEST TEST"):
+        trues = np.array(trues)
+        preds = np.array(preds)
+        target_types = np.array([str(t).lower().strip() for t in target_types])
+        
+        # 1. Mixed targets
+        mix_fav, mix_aga, mix_neu, mix_all = self.calc_group_metrics(trues, preds)
+        
+        # 2. Noun-phrase targets
+        noun_mask = (target_types == 'n')
+        noun_fav, noun_aga, noun_neu, noun_all = self.calc_group_metrics(trues[noun_mask], preds[noun_mask])
+        
+        # 3. Claim targets
+        claim_mask = (target_types == 'c')
+        clm_fav, clm_aga, clm_neu, clm_all = self.calc_group_metrics(trues[claim_mask], preds[claim_mask])
+        
+        total_acc = accuracy_score(trues, preds) * 100
+        
+        print(f"\n{'='*105}")
+        print(f"{f'BẢNG KẾT QUẢ ĐỐI SÁNH THEO CHUẨN BÀI BÁO (TABLE 2) [{epoch_info}]':^105}")
+        print(f"{'='*105}")
+        print(f"{'METHOD':<20} | {'Mixed targets':^26} | {'Noun-phrase targets':^26} | {'Claim targets':^26}")
+        print(f"{'':<20} | {'Favor':>5} {'Against':>7} {'Neutral':>7} {'All':>5} | {'Favor':>5} {'Against':>7} {'Neutral':>7} {'All':>5} | {'Favor':>5} {'Against':>7} {'Neutral':>7} {'All':>5}")
+        print(f"{'-'*21}+{'-'*28}+{'-'*28}+{'-'*27}")
+        print(f"{'Paper SITPCL':<20} | 41.03   41.34   49.07 43.81 | 40.99   47.14   54.49 47.54 | 41.06   37.34   46.02 41.47")
+        print(f"{self.config.model_type:<20} | {mix_fav:5.2f} {mix_aga:7.2f} {mix_neu:7.2f} {mix_all:5.2f} | {noun_fav:5.2f} {noun_aga:7.2f} {noun_neu:7.2f} {noun_all:5.2f} | {clm_fav:5.2f} {clm_aga:7.2f} {clm_neu:7.2f} {clm_all:5.2f}")
+        print(f"{'='*105}")
+        print(f"  * Số mẫu: Total={len(trues)} | Noun-phrase={np.sum(noun_mask)} | Claim={np.sum(claim_mask)} | Accuracy={total_acc:.2f}%")
+        print(f"{'='*105}\n")
+
+    def train_iter(self):
+        self.model.train()
+        running_loss = 0.0
+        for data in tqdm(self.trainLoader, desc="Train Iter"):
+            loss, _, _ = self.model(**data)
+            loss.backward()
+            nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
+            self.optimizer.step()
+            self.scheduler.step()
+            self.model.zero_grad()
+            running_loss += loss.item()
+        return running_loss / len(self.trainLoader)
+
+    def evaluate_iter(self, dataLoader=None, mode=None):
+        self.model.eval()
+        val_loss = 0.0
+        seq_preds, seq_trues, doc_id_lst, target_types = [], [], [], []
+        dataLoader = self.devLoader if mode == 'dev' else self.testLoader
+            
+        with torch.no_grad():
+            for data in tqdm(dataLoader, desc=f"Eval {mode}"):
+                loss, seq_output, labels = self.model(**data)
+                val_loss += loss.item()
+                seq_output = np.argmax(seq_output.detach().cpu().numpy(), -1)
+                labels = labels.detach().cpu().numpy().reshape(-1)
+                
+                seq_preds.extend(seq_output)
+                seq_trues.extend(labels)
+                doc_id_lst.extend(data['doc_id'])
+                target_types.extend(data['target_type'])
+                
+        val_loss /= len(dataLoader)
+        macro_f1 = f1_score(seq_trues, seq_preds, average='macro', zero_division=0)
+        
+        if mode == 'test':
+            pd.DataFrame({'doc_id': doc_id_lst, 'true': seq_trues, 'pred': seq_preds, 'target_type': target_types}).to_csv(self.pred_file, index=False)
+            
+        return macro_f1, val_loss, seq_trues, seq_preds, target_types
+
+    def setup_optimization(self):
+        param_optimizer = list(self.model.named_parameters())
+        no_decay = ['bias', 'LayerNorm.weight']
+        optimizer_grouped_parameters = [
+            {'params': [p for n, p in param_optimizer if 'bert' in n and not any(nd in n for nd in no_decay)], 'weight_decay': float(self.config.weight_decay), 'lr': float(self.config.bert_lr)},
+            {'params': [p for n, p in param_optimizer if 'bert' in n and any(nd in n for nd in no_decay)], 'weight_decay': 0, 'lr': float(self.config.bert_lr)},
+            {'params': [p for n, p in param_optimizer if 'bert' not in n and not any(nd in n for nd in no_decay)], 'weight_decay': float(self.config.weight_decay), 'lr': float(self.config.other_lr)},
+            {'params': [p for n, p in param_optimizer if 'bert' not in n and any(nd in n for nd in no_decay)], 'weight_decay': 0, 'lr': float(self.config.other_lr)}
+        ]
+        self.optimizer = AdamW(optimizer_grouped_parameters, eps=float(self.config.adam_epsilon))
+        total_steps = len(self.trainLoader) * (1 if self.config.debug else self.config.epoch_size)
+        self.scheduler = get_linear_schedule_with_warmup(self.optimizer, num_warmup_steps=self.config.warmup_steps, num_training_steps=total_steps)
+
+    def run(self):
+        print("--> Đang nạp dữ liệu...")
+        self.trainLoader, self.devLoader, self.testLoader = DataProcessor(self.config).get_data()
+        
+        print(f"--> Khởi tạo mô hình {self.config.model_type}...")
+        self.model = SITCL(self.config).to(self.config.device)
+        self.setup_optimization()
+        
+        epochs = 1 if self.config.debug else self.config.epoch_size
+        print(f"--> BẮT ĐẦU HUẤN LUYỆN (Chế độ: {'DEBUG' if self.config.debug else 'FULL DATA'})...\n")
+        
+        for epoch in range(epochs):
+            train_loss = self.train_iter()
+            dev_macro_f1, dev_loss, _, _, _ = self.evaluate_iter(mode='dev')
+            print(f"Epoch {epoch+1}/{epochs} | Train Loss: {train_loss:.4f} | Val Loss: {dev_loss:.4f} | Val Macro F1: {100 * dev_macro_f1:.2f}%")
+            
+            if dev_macro_f1 >= self.best_dev_f1:
+                self.best_dev_f1 = dev_macro_f1
+                test_macro_f1, test_loss, trues, preds, types = self.evaluate_iter(mode='test')
+                print(f"\n>>> [Epoch {epoch+1}] TÌM THẤY BEST MODEL MỚI! (Dev F1: {100*dev_macro_f1:.2f}%) <<<")
+                self.print_paper_comparison_table(trues, preds, types, epoch_info=f"Epoch {epoch+1}")
+                torch.save(self.model.state_dict(), os.path.join(self.save_dir, 'best_model.pth'))
+                
+        print("\n Hoàn thành huấn luyện!")
+
+=== Cell 6 [code] ===
+trainer = Trainer(config)
+trainer.run()
+
+=== Cell 7 [code] ===
+
+
