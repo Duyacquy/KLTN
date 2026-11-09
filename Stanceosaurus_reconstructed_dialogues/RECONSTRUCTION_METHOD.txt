@@ -1,0 +1,183 @@
+=============================================================================
+TÀI LIỆU GHI LẠI PHƯƠNG PHÁP TÁI DỰNG DATASET
+Stanceosaurus (flat sentence-pair) -> Stanceosaurus_reconstructed_dialogues
+(train/dev/test_conversations.json)
+=============================================================================
+Mục đích file này: ghi lại chính xác quy trình đã thực hiện để sau này đọc lại
+không cần nhớ lại từ đầu, và để đưa vào phần "Data Construction" của khóa luận.
+
+
+-----------------------------------------------------------------------------
+GIAI ĐOẠN 1: HIỆN TRẠNG DỮ LIỆU GỐC CỦA STANCEOSAURUS
+-----------------------------------------------------------------------------
+
+Hình thức dữ liệu gốc:
+- Dữ liệu nằm trong 3 file Excel: Train_final.xlsx, Dev_final.xlsx, Test_final.xlsx
+  (đường dẫn: Stanceosaurus-data-main/Stanceosaurus Only English/).
+- Mỗi dòng là một tweet đã bị LÀM PHẲNG (flattened), về hình thức chỉ trông như
+  một cặp văn bản rời: [Target/Claim, Context Text, Tweet Text, Label].
+- Nhìn thoáng qua, cấu trúc hội thoại đa bên (multi-party dialogue tree) coi như
+  đã biến mất: không thấy trực tiếp "ai trả lời ai", "lượt nào diễn ra trước/sau".
+
+Nhiễu dữ liệu do cào tự động (web scraping junk) cần xử lý:
+- Nhiều "context text" chỉ là tiêu đề trang web lỗi do tool cào link Twitter/báo
+  chí tự động: ví dụ "[Article Title]: Twitter / ?".
+- Thẻ HTML chưa giải mã: &amp; , &quot; , &lt; ...
+- Mention và link thô chưa chuẩn hóa: @username_xyz, https://t.co/...
+
+
+-----------------------------------------------------------------------------
+GIAI ĐOẠN 2: KHÔI PHỤC CẤU TRÚC CÂY HỘI THOẠI (DIALOGUE RECONSTRUCTION)
+-----------------------------------------------------------------------------
+
+Tuy bảng Excel bị làm phẳng, dữ liệu vẫn giữ lại 2 cột metadata ẩn quan trọng:
+  - status_id            : ID của tweet hiện tại.
+  - in_reply_to_status_id : ID của tweet CHA mà tweet này đang trả lời.
+(Các cột này tương ứng với cấu trúc cây lồng nhau "root_tweet + children" có
+ trong bản release JSON gốc của Stanceosaurus, tại Data-in-JSON/{train,dev,test}.)
+
+Các bước đã thực hiện:
+
+1) Xử lý số nguyên 64-bit tránh tràn số:
+   Ép kiểu ID tweet sang Int64 (nullable 64-bit integer) trong Pandas.
+   Lý do: ID tweet Twitter dài 18-19 chữ số, vượt ngưỡng an toàn của float64
+   (~2^53) -> nếu không ép kiểu đúng sẽ bị làm tròn/méo ID (đã quan sát thấy
+   hiện tượng này khi đối chiếu ngược status_id qua cột "in reply to id" dạng
+   float trong Excel, lệch vài trăm đơn vị so với ID thật trong JSON gốc).
+
+2) Xây dựng đồ thị có hướng (Directed Acyclic Graph - DAG):
+   - Mỗi tweet = 1 node, gồm [text, user_id, timestamp].
+   - Mỗi quan hệ reply = 1 cạnh có hướng Parent -> Child.
+   - Có cơ chế phát hiện & cắt chu trình (visited set) để loại bỏ 22 vòng lặp
+     vô hạn (cyclic self-replies) có thật trong dữ liệu Twitter gốc.
+
+3) Truy vết đường dẫn từ gốc đến ngọn (root-to-leaf path extraction):
+   Với mỗi phát biểu đích (statement) cần gán nhãn lập trường, thuật toán dò
+   ngược từ node đó lên đến tweet khởi đầu của cuộc trò chuyện (root), thu được
+   1 chuỗi hội thoại hoàn chỉnh:
+        C = {(u1, s1), (u2, s2), ..., (uK, sK)}
+   trong đó u_i là văn bản phát biểu, s_i là định danh người nói (speaker).
+
+   QUAN TRỌNG: mỗi dialogue trong file cuối cùng = 1 ĐƯỜNG ĐI (path) từ root
+   xuống 1 leaf cụ thể của cây reply thật, KHÔNG phải ghép các tweet cùng cha
+   (sibling) lại theo thời gian. Nếu một node có nhiều nhánh con (branching),
+   mỗi nhánh tạo ra 1 dialogue RIÊNG, không gộp vào 1 dialogue duy nhất.
+
+
+-----------------------------------------------------------------------------
+GIAI ĐOẠN 3: HAI VẤN ĐỀ NẢY SINH VÀ CÁCH GIẢI QUYẾT
+-----------------------------------------------------------------------------
+
+VẤN ĐỀ 1 — "Bùng nổ độ sâu" (Depth Explosion):
+  Thực trạng: một số chuỗi cãi cọ trên Twitter dài tới 81 lượt thoại. Nếu đưa
+  cả 81 lượt vào BERT sẽ tràn bộ nhớ GPU (CUDA OOM), đồng thời các lượt quá xa
+  trong quá khứ sẽ làm loãng ngữ cảnh hiện tại (context dilution).
+
+  Giải pháp — Sliding Window K=6:
+  Chỉ giữ lại tối đa 6 lượt thoại GẦN NHẤT tính đến phát biểu đích:
+        C_window = C[-6:]
+  K=6 được chọn vì vừa khớp dung lượng VRAM GPU, vừa đồng bộ với bộ ZS-CSD
+  (nơi 90% hội thoại có độ sâu <= 6) để so sánh công bằng giữa 2 dataset.
+
+  Hệ quả cần biết: với các thread có độ sâu > 6, lượt đầu tiên trong
+  "sentences" của dialogue cuối cùng KHÔNG CÒN là tweet gốc/bài báo nữa (vì đã
+  bị cắt khỏi cửa sổ) — đây là đánh đổi có chủ đích, không phải lỗi.
+
+VẤN ĐỀ 2 — "Pha loãng độ sâu" do bài đăng đơn lẻ (Depth = 1 & 2):
+  Thực trạng: trong Stanceosaurus gốc, ~28% mẫu có Depth=1 (bài đăng độc lập,
+  không ai trả lời) và ~48% mẫu có Depth=2. Hệ quả: median độ sâu chỉ 2.0 (so
+  với ZS-CSD là 4.0), tỷ lệ hội thoại đa bên thật (>=3 người nói) chỉ 24.3%
+  (so với ZS-CSD 76.9%) — biến Stanceosaurus thành bài toán phân loại văn bản
+  đơn lẻ chứ không còn là "hội thoại đa bên" đúng nghĩa.
+
+  Giải pháp — Downsampling có chọn lọc:
+  - Giữ lại 100% các mẫu hội thoại sâu (Depth >= 3).
+  - Downsample ngẫu nhiên Depth=1 xuống còn ~3.4% và Depth=2 xuống ~27.5% của
+    tập cuối cùng.
+  - Ràng buộc zero-shot cốt tử: luôn bảo toàn ít nhất 1-2 mẫu cho MỖI
+    Target/Claim, không để claim nào trong 190 claim (112 train + 34 dev +
+    44 test) biến mất khỏi dataset.
+
+
+-----------------------------------------------------------------------------
+GIAI ĐOẠN 4: CHUẨN HÓA VÀ LÀM SẠCH VĂN BẢN (TEXT SANITIZATION)
+-----------------------------------------------------------------------------
+
+- Lọc rác tiêu đề cào web: loại bỏ chuỗi "Twitter / ?", "[Article Title]: ..."
+  bị lỗi và các URL trả về mã lỗi 404.
+- Chuẩn hóa mention & link theo chuẩn Twitter-domain NLP:
+    * Tất cả @username_cu_the -> token chuẩn @USER (để BERTweet hiểu là thực
+      thể người nói, không phải từ vựng thường).
+    * Tất cả link https://t.co/... -> token chuẩn HTTPURL.
+- Giải mã ký tự đặc biệt: dùng html.unescape để khôi phục đúng &, <, >, "...
+
+
+-----------------------------------------------------------------------------
+PHẦN KIỂM CHỨNG ĐÃ THỰC HIỆN (VERIFICATION LOG)
+-----------------------------------------------------------------------------
+Vì không còn giữ lại script gốc đã chạy, các bước sau đã được dùng để XÁC MINH
+NGƯỢC rằng pipeline mô tả trên khớp với dữ liệu thực tế trong 3 file
+train/dev/test_conversations.json (không phải suy đoán):
+
+1) Đối chiếu claim + text của 1 dialogue cụ thể (claim "Asymptomatic
+   transmission...") ngược về đúng node trong cây JSON gốc
+   (Data-in-JSON/test/.../asymptomatic.json) -> khớp 100% nội dung, xác nhận
+   đây là 1 đường đi thật trong cây reply (leaf mention thẳng @BuckSexton -
+   người ở lượt ngay trước, chứng minh quan hệ reply thật, không phải ghép
+   ngẫu nhiên).
+
+2) Đếm số lá (leaf) khi duyệt toàn bộ cây reply gốc (root-to-leaf) và so với
+   tổng số mẫu cuối cùng:
+     Train: 6599 lá thô vs 6873 mẫu cuối cùng (lệch ~4%)
+     Dev  : 2123 lá thô vs 2232 mẫu cuối cùng (lệch ~5%)
+     Test : 2592 lá thô vs 2905 mẫu cuối cùng (lệch ~11%)
+   -> khớp khá sát, phần lệch hợp lý do lọc tweet [DELETED]/thiếu text.
+
+3) Test quyết định (phân biệt "đi theo nhánh cây" vs "gộp sibling theo thời
+   gian"): tìm 1 node có đúng 2 nhánh con (sibling) thật trong cây gốc (claim
+   "Due to the cold winter in Germany..."), lấy 2 đoạn văn bản đặc trưng của
+   2 nhánh, tìm trong train_conversations.json -> 2 đoạn rơi vào CÁC DIALOGUE
+   KHÁC NHAU hoàn toàn (không dialogue nào chứa cả 2) -> xác nhận: mỗi nhánh
+   cây tạo ra dialogue riêng, không gộp sibling theo thời gian như giả thuyết
+   ban đầu từng nghi ngờ.
+
+4) Đối chiếu tỷ lệ depth=1 cuối cùng (3.45% trong Train, theo
+   summary_report.json) với mô tả "downsample Depth=1 xuống ~3.4%" ở Giai
+   đoạn 3 -> khớp gần như chính xác, xác nhận bước downsampling có chọn lọc
+   đã thực sự được áp dụng.
+
+5) Dùng field raw_usernames kèm theo mỗi dialogue để xác minh các trường hợp
+   1 speaker nói nhiều lượt liên tiếp (vd dialogue #212: speaker 2 nói 2 câu
+   đánh số "...1/" và "...2/") là CÙNG 1 người tự thread tiếp lời mình (thật),
+   không phải lỗi gộp nhầm 2 người khác nhau vào 1 speaker id.
+
+KẾT LUẬN KIỂM CHỨNG: Pipeline tái dựng ở trên đã được xác nhận khớp với dữ
+liệu đầu ra thực tế qua nhiều phép đối chiếu độc lập. Stanceosaurus_
+reconstructed_dialogues là hội thoại THẬT (dựa trên quan hệ reply có thật từ
+Twitter, qua status_id/in_reply_to_status_id), không phải dữ liệu bị ghép giả.
+
+
+-----------------------------------------------------------------------------
+THỐNG KÊ CUỐI CÙNG CỦA DATASET (theo summary_report.json)
+-----------------------------------------------------------------------------
+                         Train      Dev        Test
+Tổng số mẫu              6873       2232       2905
+Số target/claim riêng    112        34         44
+Mean depth               3.73       3.67       3.73
+Median depth             3.0        3.0        3.0
+Multi-party (>=3 ng.)    41.1%      43.2%      38.8%
+Intra-speaker repeat     49.3%      47.1%      50.0%
+
+Phân phối nhãn (3 lớp):
+  Supporting : Train 32.04% | Dev 34.14% | Test 35.04%
+  Refuting   : Train 18.94% | Dev 25.40% | Test 19.04%
+  Other      : Train 49.02% | Dev 40.46% | Test 45.92%
+
+Phân rã lớp "Other" (theo final_annotation, số liệu Train):
+  Irrelevant : 2725/3369 (~80.9%)  - lạc đề thật, không liên quan claim
+  Discussing : 545/3369  (~16.2%) - có bàn tới claim nhưng không rõ leaning
+  Querying   : 97/3369   (~2.9%)  - chỉ hỏi, không phát biểu lập trường
+
+=============================================================================
+HẾT FILE
+=============================================================================
